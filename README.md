@@ -1,88 +1,54 @@
-# Lease 分布式锁模拟器（完全本地）
+# wavtool — 本地 WAV 音频处理工具
 
-一个纯本地的 Lease 分布式锁模拟器：多客户端以本地线程模拟（goroutine 的
-Python 对应物），锁状态、租约、fencing token 与事件日志只保存在**内存或本地
-JSON 文件**中，不依赖 Redis / etcd / ZooKeeper 或任何外部服务。
+纯 Python（仅标准库）实现的离线 WAV 处理工具。**所有音频、中间状态和输出只存在于本地文件或内存中**，不依赖任何音频服务器、云 API、媒体服务或外部服务；测试与验证全部在终端输出数值指标，不播放音频、不打开 GUI。
 
-## 结构
+## WAV 支持范围
 
-```
-leaselock/
-  clock.py    # 可注入时钟：SystemClock / FakeClock
-  store.py    # 状态持久化：MemoryStore / FileStore（原子写）
-  lock.py     # 核心：acquire / renew / release + fencing token
-  fencing.py  # FencedStore：下游资源，按 fencing token 拒绝过期写
-  client.py   # 模拟客户端：LeaseClient / AutoRenewClient（后台线程续约）
-tests/
-  test_lease_lock.py
-```
+- 容器：RIFF/WAVE，严格校验 header（RIFF/WAVE id、chunk 尺寸与文件实际大小、fmt 字段一致性、data 长度对齐等），损坏文件会被明确拒绝。
+- 格式：整型 PCM（audio_format = 1），8/16/24/32-bit；mono/stereo（最多 8 声道）。
+- 读取：按块流式解码为 `[-1.0, 1.0]` 浮点采样；写入：默认 16-bit PCM，header 尺寸在关闭时回填。
+- 不支持 IEEE float、ADPCM、mp3-in-wav 等非整型 PCM 编码（会报 `WavFormatError`）。
 
-## Lease 状态机
+## DSP 算法
 
-每个资源（resource）的租约状态机：
+所有中间计算使用 float64，避免整数溢出；只有量化回整型 PCM 时执行显式 clipping/saturation（`[-1.0, 1.0]` 截断，`-1.0` 映射到最负码值，如 16-bit 的 -32768）。
 
-```
-                 acquire 成功
-        ┌──────────────────────────┐
-        ▼                          │
-     ┌───────┐   renew 成功    ┌───┴───┐
-     │ FREE  │ ◄────────────── │ HELD  │◄──┐
-     └───┬───┘                 └───┬───┘   │ renew（延长 expires_at）
-         ▲                         │       │
-         │ release 成功            │ 时钟越过 expires_at
-         │                         ▼
-         │                      ┌────────┐
-         └──────────────────────│EXPIRED │（隐式状态：不再可 renew，
-             仅持有者可释放       └────────┘  他人 acquire 时被视为 FREE）
-```
+- **增益**：线性/dB 恒定增益。
+- **声道混合**：多声道平均下混 mono；mono 复制为 stereo。
+- **裁剪**：按秒指定 `[start, end)` 区间，按帧精确截取。
+- **淡入淡出**：线性斜坡，帧索引驱动，分块边界无接缝。
+- **重采样**：线性插值 SRC，输出长度严格为 `round(N_in * dst_rate / src_rate)`，末端采样钳位到最后一个输入采样，长度与分块大小无关。
+- **FIR 低通**：Hamming 窗 sinc 设计（`--lowpass` + `--taps`），直流增益归一化为 1；也支持直接给定系数（`--coeffs`）。流式实现，每声道维护延迟线状态。
 
-- `acquire(resource, holder, ttl)`：仅当无租约或现有租约已过期时成功；
-  成功时分配**严格递增**的 fencing token，并写入 `expires_at = now + ttl`。
-- `renew(resource, holder, token, ttl)`：仅当持有者与 token 均匹配且租约
-  **未过期**时成功；过期租约永远不可续期。
-- `release(resource, holder, token)`：仅持有者可释放；释放后他人可立即获取，
-  token 依旧单调递增。
+## 大文件分块处理
 
-## Fencing token 原理
+处理管线 `reader -> stages -> writer` 以固定块（默认 4096 帧）流式运行，任意时刻内存中只有一块采样加少量滤波器/重采样状态，不会同时保存多个完整副本。测试验证了块大小 4096 与 64 的输出逐字节一致。
 
-`LeaseLock` 维护一个持久化的单调计数器 `last_token`，每次成功 `acquire`
-加一并随租约发出。它解决经典的"停顿持有者"问题：
-
-1. 客户端 A 持有锁（token=1），发生 GC 停顿 / 网络分区，超过租约时间。
-2. 租约过期，客户端 B 成功获取锁（token=2）。
-3. A 恢复后仍以为自己是持有者，但它的 `renew` 会被锁服务拒绝
-   （租约已易主），它对下游资源的写入也会被 `FencedStore` 拒绝：
-   下游只接受**大于已见最大 token** 的写（`token <= max_token` 即抛
-   `StaleFencingToken`）。
-
-因此旧持有者恢复后永远无法拥有更新的 token，其过期写会被识别并拒绝。
-
-## 时间模型
-
-- 所有时间判断都通过可注入的 `Clock` 接口（`now()` / `wait_until()`），
-  核心代码不直接调用 `time`。
-- `SystemClock` 基于 `time.monotonic`，用于真实运行。
-- `FakeClock` 由测试手动 `advance()` 推进，并通过条件变量唤醒等待线程；
-  **测试不依赖任何真实 sleep**，线程间同步只用 barrier / event。
-- 时钟语义为单调时间：租约过期判断只依赖 `expires_at <= now`。
-
-## 持久化与重启恢复
-
-- `FileStore` 将 `{last_token, leases}` 以 JSON 原子写入本地文件
-  （临时文件 + `os.replace` + `fsync`）。
-- 重启（重新构造 `LeaseLock`）时：未到期的租约照常恢复；**已过期租约
-  直接丢弃**（记录 `expire_on_recovery` 日志），绝不错误复活。
-- `last_token` 跨重启保留，保证 fencing token 全局单调。
-- 事件日志（acquire / renew / release / 拒绝 / 过期）以 JSON Lines 追加到
-  本地日志文件。
-
-## 运行测试
+## 使用
 
 ```bash
-cd <本目录>
-python3 -m pytest -q          # 或: python3 -m pytest -v
+python3 -m wavtool in.wav out.wav \
+    --trim 0.1 0.9 --fade-in 0.05 --fade-out 0.05 \
+    --gain-db -3 --to-mono \
+    --lowpass 1500 --taps 129 \
+    --resample 22050 --bits 16 --block-frames 4096
 ```
 
-覆盖场景：竞争获取（16 线程仅 1 胜者）、续约延长与拒绝、租约超时不可续、
-客户端暂停超时后恢复（fencing 识别旧持有者）、token 单调性（含跨重启）、
-释放后重获、重启持久化恢复、后台自动续约线程保活与停顿丢锁。
+处理顺序固定为：trim → fade → gain → mix → FIR → resample。运行结束在终端打印输入/输出格式、帧数、peak、RMS 等数值指标。
+
+## 测试
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+测试通过代码生成正弦波、脉冲和静音 WAV，覆盖：
+
+- header 解析与字段校验；7 类损坏文件（错误 RIFF/WAVE id、截断、data 长度不对齐、block_align 错误、非 PCM 格式、非法位深）的拒绝；
+- 增益（RMS 比值 ≈ 1.9953 @ +6 dB）；
+- 立体声混合（反相立体声下混 mono ≈ 0；mono→stereo 两声道完全一致）；
+- 裁剪帧数精确性；淡入淡出增益曲线采样点；
+- 重采样输出帧数与频率（过零法估计 440 Hz，上/下采样）；
+- FIR 低通（Goertzel 测通带保持、阻带衰减 > 40 dB）、自定义系数的脉冲响应；
+- clipping/saturation（+12 dB 后 max=32767 / min=-32768，无符号回绕）；
+- 分块与整体处理输出逐字节一致；静音输入输出保持为零。
